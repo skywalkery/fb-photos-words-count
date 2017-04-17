@@ -24,13 +24,26 @@ app.get('/', (req, res) => {
   res.status(200).send(HTML);
 });
 
-app.get('/logged', (req, res) => {
-    const HTML = renderLoggedView({
-      title: 'Processing...',
-    });
+app.get('/processing', (req, res) => {
+    graph.get('me/photos', {fields: 'images', limit: 100, type: 'uploaded'}, (p_err, p_res) => {
+        let content = '';
 
-    res.set('Content-Type', 'text/html');
-    res.status(200).send(HTML);
+        if (p_err) {
+            console.log(p_err);
+            content = 'Something goes wrong: ' + p_err;
+        } else {
+            //console.log(p_res);
+            content = 'Processing...';
+            processPhotosResponse(p_err, p_res);
+        }
+
+        const HTML = renderProcessingView({
+          title: 'Processing...',
+          content: content
+        });
+        res.set('Content-Type', 'text/html');
+        res.status(200).send(HTML);
+    });
 });
 
 app.get('/auth', (req, res) => {
@@ -64,10 +77,28 @@ app.get('/auth', (req, res) => {
             client_secret: client_secret,
             code: req.query.code
         }, function (err, facebookRes) {
-            res.redirect('/fb-photos-words-count/logged');
+            res.redirect('/fb-photos-words-count/processing');
         });
     }
 });
+
+function processPhotosResponse(err, res) {
+    if (err) {
+        console.log('error while fetching photos:', err);
+    } else {
+        let images = res.data.map(entry => entry.images[0].source);
+        console.log(images);
+    }
+
+    if (res.paging && res.paging.next) {
+        console.log('fetch next page');
+        graph.get(res.paging.next, (err, res) => {
+            processPhotosResponse(err, res);
+        });
+    } else {
+        console.log('end fetching');
+    }
+}
 
 module.exports = fromExpress(app);
 
@@ -117,7 +148,7 @@ function renderView(locals) {
   `;
 }
 
-function renderLoggedView(locals) {
+function renderProcessingView(locals) {
     return `
       <!DOCTYPE html>
       <html>
@@ -140,7 +171,7 @@ function renderLoggedView(locals) {
 
           <body>
               <div class="container">
-                  Logged
+                  ${locals.content}
               </div>
           </body>
       </html>
