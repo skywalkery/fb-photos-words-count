@@ -4,12 +4,17 @@ import express from 'express';
 import { fromExpress } from 'webtask-tools';
 import bodyParser from 'body-parser';
 import graph from 'fbgraph';
+import Clarifai from 'clarifai';
+import { MongoClient, ObjectID } from 'mongodb';
 
 const config = {
     client_id: '1429175207143662',
     scope: 'user_photos',
-    redirect_uri: 'https://wt-50a4b43389d58ef63e72f1a6ecc08cbb-0.run.webtask.io/fb-photos-words-count/auth'
+    redirect_uri: 'https://wt-50a4b43389d58ef63e72f1a6ecc08cbb-0.run.webtask.io/fb-photos-words-count/auth',
+    clarifai_client_id: 'VXAymn5AZw6K24zhyDG0ni6A-Wm0obP536LOkmd2'
 };
+
+let clarifai = null;
 
 const app = express();
 
@@ -25,12 +30,20 @@ app.get('/', (req, res) => {
 });
 
 app.get('/processing', (req, res) => {
-    graph.get('me/photos', {fields: 'images', limit: 100, type: 'uploaded'}, (p_err, p_res) => {
+    if (!clarifai) {
+        const clarifai_client_secret = req.webtaskContext.data.clarifai_client_secret;
+        clarifai = new Clarifai.App(
+            config.clarifai_client_id,
+            clarifai_client_secret
+        );
+    }
+
+    graph.get('me/photos', {fields: 'images', limit: 1, type: 'uploaded'}, (p_err, p_res) => {
         let content = '';
 
         if (p_err) {
             console.log(p_err);
-            content = 'Something goes wrong: ' + p_err;
+            content = 'Something goes wrong: ' + p_err.message;
         } else {
             //console.log(p_res);
             content = 'Processing...';
@@ -88,6 +101,7 @@ function processPhotosResponse(err, res) {
     } else {
         let images = res.data.map(entry => entry.images[0].source);
         console.log(images);
+        images.forEach(url => photoRecognition(url));
     }
 
     if (res.paging && res.paging.next) {
@@ -100,7 +114,16 @@ function processPhotosResponse(err, res) {
     }
 }
 
-module.exports = fromExpress(app);
+function photoRecognition(url) {
+    return clarifai.models.predict(Clarifai.GENERAL_MODEL, url).then(res => {
+        // select very confident concepts
+        const concepts = res && res.outputs && res.outputs[0] &&
+            res.outputs[0].data && res.outputs[0].data.concepts || [];
+        let t = concepts.filter(concept => concept.value > 0.9)
+            .map(concept => concept.name);
+        return t;
+    });
+}
 
 function renderView(locals) {
   return `
@@ -177,3 +200,5 @@ function renderProcessingView(locals) {
       </html>
     `;
 }
+
+module.exports = fromExpress(app);
