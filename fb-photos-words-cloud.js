@@ -5,7 +5,7 @@ import { fromExpress } from 'webtask-tools';
 import bodyParser from 'body-parser';
 import graph from 'fbgraph';
 import Clarifai from 'clarifai';
-import { MongoClient, ObjectID } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
 import * as Promise from 'bluebird';
 
 const config = {
@@ -30,6 +30,35 @@ app.get('/', (req, res) => {
   res.status(200).send(HTML);
 });
 
+app.get('/ids/:id', (req, res) => {
+    MongoClient.connect(req.webtaskContext.data.mongo_url, function(err, db) {
+        if (err) {
+            console.log('mongo connect error', err);
+            res.status(200).send(err.message);
+            return;
+        }
+
+        db.collection('words').findOne( { _id: ObjectId(req.params.id) } ).then(doc => {
+            let json = doc || {list:[]};
+            //console.log(doc.list);
+            let counts = json.list.reduce((prev, item) => {
+                if (item in prev) prev[item]++;
+                else prev[item] = 1;
+                return prev;
+            }, {});
+            console.log(counts);
+            json.list = Object.keys(counts).map(key => [key, counts[key]]);
+            console.log(json.list);
+
+            res.set('Content-Type', 'application/json');
+            res.status(200).send(json);
+        });
+
+
+        db.close();
+    });
+});
+
 app.get('/processing', (req, res) => {
     if (!clarifai) {
         const clarifai_client_secret = req.webtaskContext.data.clarifai_client_secret;
@@ -49,7 +78,7 @@ app.get('/processing', (req, res) => {
         insertDocument(db, function(id) {
             const HTML = renderProcessingView({
               title: 'Processing...',
-              content: 'Processing...',
+              content: 'Processing... ' + id,
               id: id
             });
             res.set('Content-Type', 'text/html');
@@ -106,7 +135,7 @@ function insertDocument(db, callback) {
 }
 
 function getPhotosRequest(db, id) {
-    graph.get('me/photos', {fields: 'images', limit: 10, type: 'uploaded'}, (p_err, p_res) => {
+    graph.get('me/photos', {fields: 'images', limit: 2, type: 'uploaded'}, (p_err, p_res) => {
         let content = '';
 
         if (p_err) {
@@ -126,12 +155,12 @@ function processPhotosResponse(db, id, err, res) {
         updatePromise = Promise.resolve(true);
     } else {
         let images = res.data.map(entry => entry.images[0].source);
-        updatePromise = Promise.all(images.map(url => photoRecognition(url))).then(arr => {
+        updatePromise = Promise.all(images.map(url => photoRecognition(url))).then(results => {
             let merged = [];
-            arr.forEach(el => merged.unshift.apply(merged, el));
+            results.forEach(el => merged.unshift.apply(merged, el));
             db.collection('words').updateOne(
                { _id: id },
-               { $push: { list: merged } },
+               { $pushAll: { list: merged } },
                (err, result) => {
                    if (err) {
                        console.log('cannot update record', err);
@@ -227,22 +256,57 @@ function renderProcessingView(locals) {
               <meta charset="utf-8">
               <title>${locals.title}</title>
 
+              <link href="//fonts.googleapis.com/css?family=Finger+Paint" id="link-webfont" rel="stylesheet">
+              <script src="https://cdnjs.cloudflare.com/ajax/libs/wordcloud2.js/1.0.6/wordcloud2.min.js"></script>
+              <script src="//ajax.googleapis.com/ajax/libs/jquery/1/jquery.min.js"></script>
+
               <style>
                   .container {
                       display: flex;
                       justify-content: center;
                       align-items: center;
+                      flex-direction: column;
                   }
 
                   html, body, .container {
                       height: 100%;
                   }
+
+                  .canvas {
+                      width: 800px;
+                      height: 520px;
+                  }
               </style>
+
+              <script>
+                  var ping = function() {
+                      $.get('/fb-photos-words-count/ids/${locals.id}', function(resp) {
+                          if (resp && !resp.ready) {
+                              setTimeout(ping, 3000);
+                          } else if (resp.ready) {
+                              $('.progress-label').hide();
+                              WordCloud($('.canvas')[0], {
+                                  gridSize: 18,
+                                  weightFactor: 10,
+                                  fontFamily: 'Finger Paint, cursive, sans-serif',
+                                  color: '#f0f0c0',
+                                  backgroundColor: '#001f00',
+                                  list: resp.list
+                              });
+                          }
+                      });
+                  };
+
+                  $(document).ready(function() {
+                      ping();
+                  });
+              </script>
           </head>
 
           <body>
               <div class="container">
-                  ${locals.content}
+                  <div class="progress-label">${locals.content}</div>
+                  <canvas class="canvas" width="800" height="520"></canvas>
               </div>
           </body>
       </html>
