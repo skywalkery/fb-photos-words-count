@@ -6,7 +6,9 @@ import bodyParser from 'body-parser';
 import graph from 'fbgraph';
 import Clarifai from 'clarifai';
 import { MongoClient, ObjectId } from 'mongodb';
-import * as Promise from 'bluebird';
+
+const Promise = require('bluebird');
+Promise.promisifyAll(graph);
 
 const config = {
     client_id: '1429175207143662',
@@ -31,61 +33,72 @@ app.get('/', (req, res) => {
 });
 
 app.get('/ids/:id', (req, res) => {
-    MongoClient.connect(req.webtaskContext.data.mongo_url, function(err, db) {
-        if (err) {
-            console.log('mongo connect error', err);
-            res.status(200).send(err.message);
-            return;
+    let _db = null;
+
+    MongoClient.connect(req.webtaskContext.data.mongo_url, {
+        promiseLibrary: Promise
+    }).then(db => {
+        // fetch document by the requested id
+        _db = db;
+        return db.collection('words').findOne({ _id: ObjectId(req.params.id) });
+    }).then(doc => {
+        // transform list of words to list of word and count
+        let json = doc || {list:[]};
+        let counts = json.list.reduce((prev, item) => {
+            if (item in prev) prev[item]++;
+            else prev[item] = 1;
+            return prev;
+        }, {});
+        json.list = Object.keys(counts).map(key => [key, counts[key]]);
+        return json;
+    }).then(json => {
+        res.set('Content-Type', 'application/json');
+        res.status(200).send(json);
+    }).catch(err => {
+        console.log('something goes wrong', err);
+        res.set('Content-Type', 'text/plain');
+        res.status(200).send(err.message);
+    }).finally(() => {
+        if (_db) {
+            _db.close();
         }
-
-        db.collection('words').findOne( { _id: ObjectId(req.params.id) } ).then(doc => {
-            let json = doc || {list:[]};
-            //console.log(doc.list);
-            let counts = json.list.reduce((prev, item) => {
-                if (item in prev) prev[item]++;
-                else prev[item] = 1;
-                return prev;
-            }, {});
-            console.log(counts);
-            json.list = Object.keys(counts).map(key => [key, counts[key]]);
-            console.log(json.list);
-
-            res.set('Content-Type', 'application/json');
-            res.status(200).send(json);
-        });
-
-
-        db.close();
     });
 });
 
 app.get('/processing', (req, res) => {
-    if (!clarifai) {
-        const clarifai_client_secret = req.webtaskContext.data.clarifai_client_secret;
-        clarifai = new Clarifai.App(
-            config.clarifai_client_id,
-            clarifai_client_secret
-        );
-    }
+    initClarifai(req.webtaskContext.data.clarifai_client_secret);
 
-    MongoClient.connect(req.webtaskContext.data.mongo_url, function(err, db) {
-        if (err) {
-            console.log('mongo connect error', err);
-            res.status(200).send(err.message);
-            return;
-        }
+    let _db = null;
 
-        insertDocument(db, function(id) {
-            const HTML = renderProcessingView({
-              title: 'Processing...',
-              content: 'Processing... ' + id,
-              id: id
-            });
-            res.set('Content-Type', 'text/html');
-            res.status(200).send(HTML);
+    let docIdPromise = MongoClient.connect(req.webtaskContext.data.mongo_url, {
+        promiseLibrary: Promise
+    }).then(db => {
+        _db = db;
+        return insertDocument(db);
+    }).then(doc => doc.insertedId);
 
-            getPhotosRequest(db, id);
+    docIdPromise.then(id => {
+        const HTML = renderProcessingView({
+          title: 'Processing...',
+          content: 'Processing... ' + id,
+          id: id
         });
+        res.set('Content-Type', 'text/html');
+        res.status(200).send(HTML);
+    }).catch(err => {
+        console.log('something goes wrong', err);
+        res.set('Content-Type', 'text/plain');
+        res.status(200).send(err.message);
+    });
+
+    docIdPromise.then(id => {
+        return getPhotosRequest(_db, id);
+    }).catch(err => {
+        console.log('something goes wrong while photos process', err);
+    }).finally(() => {
+        if (_db) {
+            _db.close();
+        }
     });
 });
 
@@ -95,7 +108,7 @@ app.get('/auth', (req, res) => {
     if (!req.query.code) {
         console.log("Performing oauth for some user right now.");
 
-        var authUrl = graph.getOauthUrl({
+        let authUrl = graph.getOauthUrl({
             client_id: config.client_id,
             redirect_uri: config.redirect_uri,
             scope: config.scope
@@ -103,14 +116,14 @@ app.get('/auth', (req, res) => {
 
         if (!req.query.error) { //checks whether a user denied the app facebook login/permissions
             res.redirect(authUrl);
-        } else {  //req.query.error == 'access_denied'
+        } else {
             res.status(403).send('access denied');
         }
     }
     // If this branch executes user is already being redirected back with
     // code (whatever that is)
     else {
-        console.log("Oauth successful, the code (whatever it is) is: ", req.query.code);
+        console.log("Oauth successful, the code is: ", req.query.code);
         // code is set
         // we'll send that and get the access token
         const client_secret = req.webtaskContext.data.fb_client_secret;
@@ -125,68 +138,63 @@ app.get('/auth', (req, res) => {
     }
 });
 
-function insertDocument(db, callback) {
-    db.collection('words').insertOne({
+function initClarifai(secret) {
+    if (!clarifai) {
+        // initialize clarifai if it is not initialized yet
+        clarifai = new Clarifai.App(
+            config.clarifai_client_id,
+            secret
+        );
+    }
+}
+
+function insertDocument(db) {
+    return db.collection('words').insertOne({
         list: [],
         ready: false
-    }, (err, result) => {
-        callback(result.insertedId);
     });
 }
 
 function getPhotosRequest(db, id) {
-    graph.get('me/photos', {fields: 'images', limit: 2, type: 'uploaded'}, (p_err, p_res) => {
-        let content = '';
-
-        if (p_err) {
-            console.log('cannot get photos from fb:', p_err);
-            db.close();
-        } else {
-            processPhotosResponse(db, id, p_err, p_res);
-        }
+    return graph.getAsync('me/photos', {fields: 'images', limit: 100, type: 'uploaded'}).then(res => {
+        return processPhotosResponse(db, id, res);
     });
 }
 
-function processPhotosResponse(db, id, err, res) {
-    let updatePromise;
+function processPhotosResponse(db, id, res) {
+    let images = res.data.map(entry => entry.images[0].source);
+    let updatePromise = Promise.all(images.map(url => photoRecognition(url))).then(results => {
+        // combine arrays into one array
+        let merged = [];
+        results.forEach(el => merged.unshift.apply(merged, el));
+        return merged;
+    }).then(list => {
+        return db.collection('words').updateOne(
+           { _id: id },
+           { $pushAll: { list } }
+        );
+    });
 
-    if (err) {
-        console.log('error while fetching photos:', err);
-        updatePromise = Promise.resolve(true);
-    } else {
-        let images = res.data.map(entry => entry.images[0].source);
-        updatePromise = Promise.all(images.map(url => photoRecognition(url))).then(results => {
-            let merged = [];
-            results.forEach(el => merged.unshift.apply(merged, el));
-            db.collection('words').updateOne(
-               { _id: id },
-               { $pushAll: { list: merged } },
-               (err, result) => {
-                   if (err) {
-                       console.log('cannot update record', err);
-                   }
-               }
-           );
-        });
-    }
+    let continuePromise = null;
 
-    if (false && res.paging && res.paging.next) {
+    if (res.paging && res.paging.next) {
+        // fetch next page
         console.log('fetch next page');
-        graph.get(res.paging.next, (err, res) => {
-            processPhotosResponse(db, id, err, res);
+        continuePromise = graph.getAsync(res.paging.next).then(res => {
+            return processPhotosResponse(db, id, res);
         });
     } else {
-        updatePromise.then(res => {
-            db.collection('words').updateOne(
+        // no more data, set ready flag
+        continuePromise = updatePromise.then(res => {
+            return db.collection('words').updateOne(
                 { _id: id },
-                { $set: { ready: true } },
-                (err, res) => {
-                    db.close();
-                }
+                { $set: { ready: true } }
             );
         })
         console.log('end fetching');
     }
+
+    return Promise.all([updatePromise, continuePromise]);
 }
 
 function photoRecognition(url) {
@@ -257,7 +265,7 @@ function renderProcessingView(locals) {
               <title>${locals.title}</title>
 
               <link href="//fonts.googleapis.com/css?family=Finger+Paint" id="link-webfont" rel="stylesheet">
-              <script src="https://cdnjs.cloudflare.com/ajax/libs/wordcloud2.js/1.0.6/wordcloud2.min.js"></script>
+              <script src="//cdnjs.cloudflare.com/ajax/libs/wordcloud2.js/1.0.6/wordcloud2.min.js"></script>
               <script src="//ajax.googleapis.com/ajax/libs/jquery/1/jquery.min.js"></script>
 
               <style>
@@ -275,6 +283,7 @@ function renderProcessingView(locals) {
                   .canvas {
                       width: 800px;
                       height: 520px;
+                      display: none;
                   }
               </style>
 
@@ -285,6 +294,7 @@ function renderProcessingView(locals) {
                               setTimeout(ping, 3000);
                           } else if (resp.ready) {
                               $('.progress-label').hide();
+                              $('.canvas').show();
                               WordCloud($('.canvas')[0], {
                                   gridSize: 18,
                                   weightFactor: 10,
