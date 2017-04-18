@@ -4,6 +4,7 @@
   "description": "",
   "main": "fb-photos-words-cloud.js",
   "dependencies": {
+    "bluebird": "^3.5.0",
     "body-parser": "^1.17.1",
     "clarifai": "^2.1.5",
     "express": "^4.15.2",

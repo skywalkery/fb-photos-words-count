@@ -6,6 +6,7 @@ import bodyParser from 'body-parser';
 import graph from 'fbgraph';
 import Clarifai from 'clarifai';
 import { MongoClient, ObjectID } from 'mongodb';
+import * as Promise from 'bluebird';
 
 const config = {
     client_id: '1429175207143662',
@@ -38,24 +39,24 @@ app.get('/processing', (req, res) => {
         );
     }
 
-    graph.get('me/photos', {fields: 'images', limit: 1, type: 'uploaded'}, (p_err, p_res) => {
-        let content = '';
-
-        if (p_err) {
-            console.log(p_err);
-            content = 'Something goes wrong: ' + p_err.message;
-        } else {
-            //console.log(p_res);
-            content = 'Processing...';
-            processPhotosResponse(p_err, p_res);
+    MongoClient.connect(req.webtaskContext.data.mongo_url, function(err, db) {
+        if (err) {
+            console.log('mongo connect error', err);
+            res.status(200).send(err.message);
+            return;
         }
 
-        const HTML = renderProcessingView({
-          title: 'Processing...',
-          content: content
+        insertDocument(db, function(id) {
+            const HTML = renderProcessingView({
+              title: 'Processing...',
+              content: 'Processing...',
+              id: id
+            });
+            res.set('Content-Type', 'text/html');
+            res.status(200).send(HTML);
+
+            getPhotosRequest(db, id);
         });
-        res.set('Content-Type', 'text/html');
-        res.status(200).send(HTML);
     });
 });
 
@@ -95,21 +96,66 @@ app.get('/auth', (req, res) => {
     }
 });
 
-function processPhotosResponse(err, res) {
+function insertDocument(db, callback) {
+    db.collection('words').insertOne({
+        list: [],
+        ready: false
+    }, (err, result) => {
+        callback(result.insertedId);
+    });
+}
+
+function getPhotosRequest(db, id) {
+    graph.get('me/photos', {fields: 'images', limit: 10, type: 'uploaded'}, (p_err, p_res) => {
+        let content = '';
+
+        if (p_err) {
+            console.log('cannot get photos from fb:', p_err);
+            db.close();
+        } else {
+            processPhotosResponse(db, id, p_err, p_res);
+        }
+    });
+}
+
+function processPhotosResponse(db, id, err, res) {
+    let updatePromise;
+
     if (err) {
         console.log('error while fetching photos:', err);
+        updatePromise = Promise.resolve(true);
     } else {
         let images = res.data.map(entry => entry.images[0].source);
-        console.log(images);
-        images.forEach(url => photoRecognition(url));
+        updatePromise = Promise.all(images.map(url => photoRecognition(url))).then(arr => {
+            let merged = [];
+            arr.forEach(el => merged.unshift.apply(merged, el));
+            db.collection('words').updateOne(
+               { _id: id },
+               { $push: { list: merged } },
+               (err, result) => {
+                   if (err) {
+                       console.log('cannot update record', err);
+                   }
+               }
+           );
+        });
     }
 
-    if (res.paging && res.paging.next) {
+    if (false && res.paging && res.paging.next) {
         console.log('fetch next page');
         graph.get(res.paging.next, (err, res) => {
-            processPhotosResponse(err, res);
+            processPhotosResponse(db, id, err, res);
         });
     } else {
+        updatePromise.then(res => {
+            db.collection('words').updateOne(
+                { _id: id },
+                { $set: { ready: true } },
+                (err, res) => {
+                    db.close();
+                }
+            );
+        })
         console.log('end fetching');
     }
 }
@@ -119,9 +165,11 @@ function photoRecognition(url) {
         // select very confident concepts
         const concepts = res && res.outputs && res.outputs[0] &&
             res.outputs[0].data && res.outputs[0].data.concepts || [];
-        let t = concepts.filter(concept => concept.value > 0.9)
+        return concepts.filter(concept => concept.value > 0.9)
             .map(concept => concept.name);
-        return t;
+    }).catch(err => {
+        console.log('recognition error:', err);
+        return [];
     });
 }
 
